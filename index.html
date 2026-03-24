@@ -310,7 +310,6 @@ input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
   .summary-grid { grid-template-columns: 1fr; }
   .nav-tab { font-size: 0.62rem; padding: 8px 4px; }
 }
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 </style>
 </head>
 <body>
@@ -2357,6 +2356,15 @@ function handleSync() {
 }
 
 function signInWithGoogle() {
+  if (typeof google === 'undefined' || !google.accounts) {
+    setSyncStatus('Google sign-in library not loaded yet. Please wait a moment and try again.', 'var(--red)');
+    // Try loading it dynamically as fallback
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.onload = () => setSyncStatus('Ready. Please click Sync again.', 'var(--green)');
+    document.head.appendChild(s);
+    return;
+  }
   setSyncStatus('Opening Google sign-in…', 'var(--ink3)');
   const client = google.accounts.oauth2.initTokenClient({
     client_id: GDRIVE_CLIENT_ID,
@@ -2537,5 +2545,6 @@ document.addEventListener('DOMContentLoaded', () => {
   renderRecent();
 });
 </script>
+<script src="https://accounts.google.com/gsi/client"></script>
 </body>
 </html>
