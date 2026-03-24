@@ -310,6 +310,7 @@ input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
   .summary-grid { grid-template-columns: 1fr; }
   .nav-tab { font-size: 0.62rem; padding: 8px 4px; }
 }
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 </style>
 </head>
 <body>
@@ -324,8 +325,12 @@ input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
     <div class="header-actions">
       <button class="btn btn-secondary btn-sm" onclick="openImport()">⬆ Import</button>
       <button class="btn btn-secondary btn-sm" onclick="exportCSV()">⬇ Export</button>
+      <button class="btn btn-secondary btn-sm" id="sync-btn" onclick="handleSync()" title="Sync with Google Drive">
+        ☁ <span id="sync-label">Sync</span>
+      </button>
     </div>
   </header>
+  <div id="sync-status" style="display:none;font-size:0.72rem;text-align:right;margin-bottom:8px;color:var(--ink3)"></div>
 
   <!-- NAV -->
   <nav class="nav-tabs">
@@ -785,6 +790,10 @@ input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
 <div class="toast" id="toast"></div>
 
 <script>
+// Google Drive sync state — declared first to avoid hoisting issues
+let gAccessToken = null;
+let gDriveFileId = null;
+
 // ══════════════════════════════════════════════════════
 //  DATA LAYER
 // ══════════════════════════════════════════════════════
@@ -821,7 +830,7 @@ function defaultData() {
   };
 }
 
-function saveData() {
+function saveData_local_only() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
 }
 
@@ -2320,6 +2329,203 @@ function resetAssumptions() {
   drawForecastChart();
   renderForecastTable();
   toast('Reset to tracked averages ✓');
+}
+
+// ══════════════════════════════════════════════════════
+//  GOOGLE DRIVE SYNC
+// ══════════════════════════════════════════════════════
+
+const GDRIVE_CLIENT_ID = '707317915142-st4eenhnfnrcss4u3590ukmp6pm6df3d.apps.googleusercontent.com';
+const GDRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+const GDRIVE_FILE_NAME = 'mizan_data.json';
+
+function setSyncStatus(msg, color) {
+  const el = document.getElementById('sync-status');
+  el.style.display = msg ? 'block' : 'none';
+  el.style.color = color || 'var(--ink3)';
+  el.textContent = msg;
+}
+
+function handleSync() {
+  if (gAccessToken) {
+    // Already signed in — do sync
+    syncWithDrive();
+  } else {
+    // Need to sign in first
+    signInWithGoogle();
+  }
+}
+
+function signInWithGoogle() {
+  setSyncStatus('Opening Google sign-in…', 'var(--ink3)');
+  const client = google.accounts.oauth2.initTokenClient({
+    client_id: GDRIVE_CLIENT_ID,
+    scope: GDRIVE_SCOPE,
+    callback: (response) => {
+      if (response.error) {
+        setSyncStatus('Sign-in failed: ' + response.error, 'var(--red)');
+        return;
+      }
+      gAccessToken = response.access_token;
+      document.getElementById('sync-label').textContent = 'Syncing…';
+      setSyncStatus('Signed in. Syncing…', 'var(--ink3)');
+      syncWithDrive();
+    }
+  });
+  client.requestAccessToken({ prompt: 'consent' });
+}
+
+async function syncWithDrive() {
+  const btn = document.getElementById('sync-btn');
+  btn.disabled = true;
+  document.getElementById('sync-label').textContent = 'Syncing…';
+  setSyncStatus('Connecting to Google Drive…', 'var(--ink3)');
+
+  try {
+    // Step 1: find existing file
+    if (!gDriveFileId) {
+      gDriveFileId = await findDriveFile();
+    }
+
+    if (gDriveFileId) {
+      // File exists — load remote, merge, then save back
+      await loadAndMerge();
+    } else {
+      // No file yet — create it with current local data
+      gDriveFileId = await createDriveFile();
+      setSyncStatus('✓ Data saved to Google Drive · ' + nowLabel(), 'var(--green)');
+    }
+  } catch(err) {
+    setSyncStatus('Sync error: ' + err.message, 'var(--red)');
+    if (err.message && err.message.includes('401')) {
+      gAccessToken = null;
+      gDriveFileId = null;
+      document.getElementById('sync-label').textContent = 'Sync';
+    }
+  } finally {
+    btn.disabled = false;
+    document.getElementById('sync-label').textContent = 'Sync';
+  }
+}
+
+async function findDriveFile() {
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='${GDRIVE_FILE_NAME}'&fields=files(id,name,modifiedTime)`,
+    { headers: { Authorization: 'Bearer ' + gAccessToken } }
+  );
+  if (!res.ok) throw new Error('Drive search failed: ' + res.status);
+  const data = await res.json();
+  return data.files && data.files.length > 0 ? data.files[0].id : null;
+}
+
+async function loadAndMerge() {
+  setSyncStatus('Loading from Google Drive…', 'var(--ink3)');
+
+  // Download remote data
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${gDriveFileId}?alt=media`,
+    { headers: { Authorization: 'Bearer ' + gAccessToken } }
+  );
+  if (!res.ok) throw new Error('Drive download failed: ' + res.status);
+  const remote = await res.json();
+
+  // Merge: combine transactions by ID (no duplicates), prefer remote for settings
+  const localTxIds = new Set(DB.transactions.map(t => t.id));
+  const remoteTxIds = new Set((remote.transactions || []).map(t => t.id));
+
+  // Add remote transactions not in local
+  (remote.transactions || []).forEach(t => {
+    if (!localTxIds.has(t.id)) DB.transactions.push(t);
+  });
+
+  // Add local transactions not in remote (already in DB)
+  // Merge accounts: prefer most recent by checking both sets
+  const localAccIds = new Set(DB.accounts.map(a => a.id));
+  (remote.accounts || []).forEach(a => {
+    if (!localAccIds.has(a.id)) DB.accounts.push(a);
+  });
+
+  // Merge loans
+  if (!DB.loans) DB.loans = [];
+  const localLoanIds = new Set(DB.loans.map(l => l.id));
+  (remote.loans || []).forEach(l => {
+    if (!localLoanIds.has(l.id)) DB.loans.push(l);
+  });
+
+  // Merge categories
+  (remote.categories || []).forEach(c => {
+    if (!DB.categories.includes(c)) DB.categories.push(c);
+  });
+
+  // Merge FX rates — remote wins for any key not in local
+  const remoteFX = remote.fxRates || {};
+  Object.keys(remoteFX).forEach(k => {
+    if (!DB.fxRates[k]) DB.fxRates[k] = remoteFX[k];
+  });
+
+  // Sort transactions by date
+  DB.transactions.sort((a, b) => b.date.localeCompare(a.date));
+
+  // Save merged data locally
+  saveData();
+
+  // Push merged data back to Drive
+  await updateDriveFile();
+
+  setSyncStatus('✓ Synced with Google Drive · ' + nowLabel(), 'var(--green)');
+
+  // Refresh UI
+  renderRecent();
+  populateLogSelects();
+  if (document.getElementById('section-overview').classList.contains('active')) renderOverview();
+  if (document.getElementById('section-accounts').classList.contains('active')) renderAccounts();
+  if (document.getElementById('section-history').classList.contains('active')) { populateFilterSelects(); renderHistory(); }
+  if (document.getElementById('section-summary').classList.contains('active')) { populateSummarySelects(); renderSummary(); }
+
+  toast('Synced with Google Drive ✓');
+}
+
+async function createDriveFile() {
+  setSyncStatus('Creating file in Google Drive…', 'var(--ink3)');
+  const content = JSON.stringify(DB);
+  const metadata = { name: GDRIVE_FILE_NAME, parents: ['appDataFolder'] };
+
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+  form.append('file', new Blob([content], { type: 'application/json' }));
+
+  const res = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+    { method: 'POST', headers: { Authorization: 'Bearer ' + gAccessToken }, body: form }
+  );
+  if (!res.ok) throw new Error('Drive create failed: ' + res.status);
+  const data = await res.json();
+  return data.id;
+}
+
+async function updateDriveFile() {
+  const content = JSON.stringify(DB);
+  const res = await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${gDriveFileId}?uploadType=media`,
+    {
+      method: 'PATCH',
+      headers: { Authorization: 'Bearer ' + gAccessToken, 'Content-Type': 'application/json' },
+      body: content
+    }
+  );
+  if (!res.ok) throw new Error('Drive update failed: ' + res.status);
+}
+
+function nowLabel() {
+  return new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
+// Auto-sync after every save if signed in
+function saveData() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
+  if (typeof gAccessToken !== 'undefined' && gAccessToken && gDriveFileId) {
+    updateDriveFile().catch(() => {});
+  }
 }
 
 // ══════════════════════════════════════════════════════
